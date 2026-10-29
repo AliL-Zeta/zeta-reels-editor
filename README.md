@@ -7,7 +7,8 @@ built with and for Claude Code.
   with **verified** screenshots of the sources placed where they are mentioned,
   plus a report showing every cut and every insert with its reason. It learns
   the editing style from past videos first, then applies it.
-* **Publish** to TikTok, Instagram Reels and Facebook Reels in one command:
+* **Publish** to TikTok, Instagram Reels, Facebook Reels and Instagram Stories
+  (split into 60 s parts) in one command:
   `zeta publish`.
 
 ## What you need
@@ -144,6 +145,7 @@ zeta publish --login tiktok                      # once per platform (meta = Fac
 zeta publish final.mp4 --suggest-caption         # draft caption in edit/caption.txt, edit it
 zeta publish final.mp4 --to tiktok,ig,fb --privacy PUBLIC_TO_EVERYONE
 zeta publish final.mp4 --to all --privacy ... --at "2026-11-02 18:00"
+zeta publish final.mp4 --to tiktok,story --privacy ...   # + Instagram Stories, cut into <=60 s parts
 ```
 
 Needs your own TikTok and Meta developer apps (keys in `.env`, see

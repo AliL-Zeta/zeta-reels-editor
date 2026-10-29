@@ -23,3 +23,6 @@ limits:
   # Page video instead, which Facebook shows as a Reel since June 2025.
   facebook_max_s: 90
   # TikTok: per account, read from creator_info at publish time.
+  # Instagram Stories: a video Story is at most 60 s, so longer videos are cut
+  # into parts at sentence ends. Meta's Stories spec; not yet run live.
+  story_max_s: 60

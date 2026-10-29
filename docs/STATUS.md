@@ -208,6 +208,12 @@ post to the owner's accounts. Facebook videos
 over 90 s go up as regular Page videos (Reels API cap); Instagram files over
 300 MB are re-encoded two-pass to fit (checked on a real clip).
 
+Instagram Stories (`--to story`, 2026-10-29): the video is cut into parts of at most
+60 s at caption-cue gaps (sentence ends preferred, never inside a cue), then
+posted in order without a caption. Dry run on IMG_7507 (2:52) gave 0:57 / 0:59 /
+0:56; the second cut lands on a comma because the only sentence end that would
+leave a final part of 60 s or less is 0.1 s too early. **Not yet posted live.**
+
 ## Waiting on Ali
 
 * 3-10 raw/published pairs plus `pairs.csv` (format in `helpers/fetch.py`).

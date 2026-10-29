@@ -4,6 +4,7 @@
     zeta publish final.mp4 --suggest-caption          # writes edit/caption.txt to edit
     zeta publish final.mp4 --to tiktok,ig,fb --privacy PUBLIC_TO_EVERYONE
     zeta publish final.mp4 --to all --privacy ... --at "2026-10-29 18:00"
+    zeta publish final.mp4 --to tiktok,story --privacy ...   # + IG Stories, 60 s parts
 
 Spec: docs/PUBLISH_SPEC.md. The order is always the same: preflight every chosen
 platform, one confirmation, then post one platform at a time. A preflight
@@ -18,6 +19,8 @@ Uploads go straight from the Mac, nothing is hosted:
   consent before upload. The confirmation screen is exactly that.
 * Instagram and Facebook: one Meta login, the Page token covers both. Binary
   goes to rupload.facebook.com.
+* Instagram Stories (`story`): the video is cut into parts of at most 60 s at
+  sentence ends (caption cue boundaries), posted in order, no caption.
 
 App keys live in `.env`; user tokens in ~/.config/zeta/, mode 600, never in the
 repo or a footage folder.
@@ -30,6 +33,7 @@ import datetime as dt
 import hashlib
 import http.server
 import json
+import math
 import os
 import plistlib
 import re
@@ -54,8 +58,10 @@ except ImportError:  # running as `python helpers/publish.py`
     from helpers.env import load_env
     from helpers.paths import REPO_ROOT
 
-PLATFORMS = ("tiktok", "instagram", "facebook")
-ALIASES = {"tt": "tiktok", "ig": "instagram", "fb": "facebook"}
+PLATFORMS = ("tiktok", "instagram", "facebook", "story")   # also the posting order
+ALL = PLATFORMS[:3]   # `--to all` means the Reels; Stories are always asked for by name
+ALIASES = {"tt": "tiktok", "ig": "instagram", "fb": "facebook",
+           "stories": "story", "ig-story": "story", "ig-stories": "story"}
 CAPTION_FLAGS = {"tiktok": "caption_tiktok", "instagram": "caption_ig",
                  "facebook": "caption_fb"}
 
@@ -97,11 +103,11 @@ def parse_to(value: str | None) -> list[str]:
     if not value:
         raise PublishError("say where: --to tiktok,ig,fb or --to all")
     names = [ALIASES.get(v.strip().lower(), v.strip().lower()) for v in value.split(",") if v.strip()]
-    if names == ["all"]:
-        return list(PLATFORMS)
+    if "all" in names:
+        names = [n for n in names if n != "all"] + list(ALL)
     bad = [n for n in names if n not in PLATFORMS]
     if bad:
-        raise PublishError(f"unknown platform {', '.join(bad)} (tiktok, ig, fb, all)")
+        raise PublishError(f"unknown platform {', '.join(bad)} (tiktok, ig, fb, story, all)")
     return [p for p in PLATFORMS if p in names]
 
 
@@ -198,6 +204,48 @@ def fit_size(video: Path, max_bytes: int, duration: float, out: Path) -> Path:
     if out.stat().st_size > max_bytes:
         raise PublishError(f"re-encode still {out.stat().st_size / MB:.0f} MB")
     return out
+
+
+def srt_cues(srt: str) -> list[tuple[float, float, str]]:
+    """(start, end, text) per cue, seconds."""
+    def sec(t: str) -> float:
+        h, m, rest = t.strip().replace(",", ".").split(":")
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+    cues = []
+    for block in re.split(r"\n\s*\n", srt.strip()):
+        lines = [l for l in block.splitlines() if l.strip()]
+        for i, line in enumerate(lines):
+            if "-->" in line:
+                a, b = line.split("-->")
+                cues.append((sec(a), sec(b), " ".join(lines[i + 1:]).strip()))
+                break
+    return cues
+
+
+def story_breaks(cues: list[tuple[float, float, str]]) -> list[tuple[float, bool]]:
+    """Places a Story may start: midway in the gap after each cue, never inside
+    one. True where the cue ends a sentence."""
+    return [((a[1] + b[0]) / 2, a[2].rstrip("\"'”»").endswith((".", "!", "?", "…")))
+            for a, b in zip(cues, cues[1:])]
+
+
+def story_cuts(duration: float, breaks: list[tuple[float, bool]], max_s: float = 60,
+               min_s: float = 3) -> list[float]:
+    """Cut times splitting the video into parts of at most max_s, as even as the
+    breaks allow, preferring sentence ends. No usable break in a window: cut at
+    the limit (mid-word; only happens with no captions at all)."""
+    cuts, start = [], 0.0
+    while duration - start > max_s:
+        left = duration - start
+        n = math.ceil(left / max_s)
+        target = start + left / n
+        # Not so early that the rest no longer fits in n - 1 parts.
+        lo = max(start + min_s, duration - (n - 1) * max_s)
+        ok = [(t, s) for t, s in breaks if lo <= t <= min(start + max_s, duration - min_s)]
+        pool = [t for t, s in ok if s] or [t for t, _ in ok] or [start + max_s]
+        start = min(pool, key=lambda t: abs(t - target))
+        cuts.append(start)
+    return cuts
 
 
 def srt_text(srt: str) -> str:
@@ -608,11 +656,93 @@ def post_facebook(job: dict, ctx: dict, caption: str) -> dict:
     return {"id": vid, "url": f"https://www.facebook.com/reel/{vid}"}
 
 
+def cut_story_parts(video: Path, cuts: list[float], duration: float) -> list[Path]:
+    """Re-encoded, not stream-copied: a copy can only start on a keyframe, which
+    would shift the cut off the sentence end. Capped at 10 Mbps so a 60 s part
+    stays ~75 MB. Cached next to the video."""
+    out_dir = _edit_dir(video) / "story"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    edges = [0.0, *cuts, duration]
+    parts = []
+    for i, (a, b) in enumerate(zip(edges, edges[1:]), 1):
+        out = out_dir / f"{video.stem}.part{i}of{len(edges) - 1}.mp4"
+        if not (out.exists() and out.stat().st_mtime >= video.stat().st_mtime):
+            try:
+                subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{a:.3f}", "-to", f"{b:.3f}",
+                                "-i", str(video), "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                                "-maxrate", "10M", "-bufsize", "20M", "-pix_fmt", "yuv420p",
+                                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)],
+                               check=True)
+            except subprocess.CalledProcessError as exc:
+                out.unlink(missing_ok=True)
+                raise PublishError(f"cutting Story part {i} failed: {exc}")
+        parts.append(out)
+    for old in out_dir.glob(f"{video.stem}.part*.mp4"):   # from an earlier split
+        if old not in parts:
+            old.unlink()
+    return parts
+
+
+def preflight_story(job: dict, media: dict, limits: dict) -> dict:
+    meta = _load_secret("meta")
+    if not meta.get("ig_id"):
+        raise PublishError("no Instagram account linked to the Facebook Page")
+    if media["duration"] < limits["min_duration_s"]:
+        raise PublishError(f"Stories need at least {limits['min_duration_s']}s")
+    video = Path(job["video"])
+    caps = _edit_dir(video) / "captions"
+    srt = next((f for f in (caps / "final.en.srt", caps / "final.srt") if f.exists()), None)
+    breaks = story_breaks(srt_cues(srt.read_text(encoding="utf-8"))) if srt else []
+    if not srt and media["duration"] > limits["story_max_s"]:
+        print("story: no edit/captions/*.srt, parts are cut at the time limit, maybe mid-word")
+    cuts = story_cuts(media["duration"], breaks, limits["story_max_s"], limits["min_duration_s"])
+    if cuts:
+        print(f"story: cutting {len(cuts) + 1} parts...")
+    parts = cut_story_parts(video, cuts, media["duration"]) if cuts else [video]
+    quota = _graph("GET", f"{meta['ig_id']}/content_publishing_limit", meta["page_token"],
+                   fields="quota_usage,config").get("data", [{}])[0]
+    if quota.get("quota_usage", 0) + len(parts) > quota.get("config", {}).get("quota_total", 1e9):
+        raise PublishError(f"Instagram daily API post limit leaves no room for {len(parts)} Stories")
+    edges = [0.0, *cuts, media["duration"]]
+    lengths = " ".join(f"{int(b - a) // 60}:{round(b - a) % 60:02d}" for a, b in zip(edges, edges[1:]))
+    return {"meta": meta, "parts": [str(p) for p in parts], "account": f"@{meta['ig_username']}",
+            "detail": f"{len(parts)} Stories {lengths}"}
+
+
+def post_story(job: dict, ctx: dict, caption: str) -> dict:
+    """One part at a time, each published before the next uploads, so they
+    appear in order. Stories take no caption."""
+    meta = ctx["meta"]
+    token, ig = meta["page_token"], meta["ig_id"]
+    ids = []
+    for i, part in enumerate(ctx["parts"], 1):
+        try:
+            container = _graph("POST", f"{ig}/media", token, media_type="STORIES",
+                               upload_type="resumable")
+            _rupload(container["uri"], token, Path(part))
+
+            def check() -> bool:
+                st = _graph("GET", container["id"], token, fields="status_code,status")
+                if st.get("status_code") in ("ERROR", "EXPIRED"):
+                    raise PublishError(f"Instagram rejected it: {st.get('status')}")
+                return st.get("status_code") == "FINISHED"
+
+            _poll(check, every=10, timeout=600, what="Instagram Story")
+            ids.append(_graph("POST", f"{ig}/media_publish", token,
+                              creation_id=container["id"])["id"])
+        except PublishError as exc:
+            raise PublishError(f"part {i}/{len(ctx['parts'])}: {exc} "
+                               f"({len(ids)} earlier part(s) already posted)")
+        print(f"  story: part {i}/{len(ctx['parts'])} posted")
+    return {"id": ",".join(ids), "url": f"https://www.instagram.com/stories/{meta['ig_username']}/"}
+
+
 # Tests swap entries here instead of faking HTTP for every platform.
 PLATFORM_FUNCS: dict[str, tuple[Callable, Callable]] = {
     "tiktok": (preflight_tiktok, post_tiktok),
     "instagram": (preflight_instagram, post_instagram),
     "facebook": (preflight_facebook, post_facebook),
+    "story": (preflight_story, post_story),
 }
 
 
@@ -620,6 +750,8 @@ PLATFORM_FUNCS: dict[str, tuple[Callable, Callable]] = {
 
 
 def caption_for(job: dict, platform: str) -> str:
+    if platform == "story":
+        return ""
     caps = job.get("captions", {})
     return caps.get(platform) or caps.get("default", "")
 
@@ -724,8 +856,8 @@ def summary(job: dict, media: dict, ctxs: dict) -> str:
     for p in job["to"]:
         cap = caption_for(job, p)
         lines.append(f"{p:<10} {ctxs[p]['account']:<28} {ctxs[p]['detail']:<20} "
-                     f"caption {len(cap)} chars")
-    caps = {caption_for(job, p) for p in job["to"]}
+                     + ("" if p == "story" else f"caption {len(cap)} chars"))
+    caps = {caption_for(job, p) for p in job["to"] if p != "story"}
     for cap in caps:
         lines.append("Caption:\n  " + (cap.replace("\n", "\n  ") if cap else "(none)"))
     if "tiktok" in job["to"]:
@@ -857,11 +989,12 @@ def _accounts() -> None:
 def build_job(args) -> dict:
     video = Path(args.video).resolve()
     to = parse_to(args.to)
-    if args.draft and "instagram" in to:
-        print("instagram: no drafts via the API, skipped (post it without --draft)")
-        to.remove("instagram")
-        if not to:
-            raise PublishError("nothing left to post")
+    for p in ("instagram", "story"):
+        if args.draft and p in to:
+            print(f"{p}: no drafts via the API, skipped (post it without --draft)")
+            to.remove(p)
+    if not to:
+        raise PublishError("nothing left to post")
     default = args.caption
     if args.caption_file:
         default = Path(args.caption_file).read_text(encoding="utf-8").strip()
@@ -883,7 +1016,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="zeta publish", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("video", nargs="?")
-    ap.add_argument("--to", help="tiktok,ig,fb or all (required)")
+    ap.add_argument("--to", help="tiktok,ig,fb,story or all (= the three Reels; required)")
     g = ap.add_argument_group("caption")
     g.add_argument("--caption", help="same caption everywhere (default: edit/caption.txt)")
     g.add_argument("--caption-file")

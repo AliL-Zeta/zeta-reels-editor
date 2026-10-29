@@ -188,3 +188,9 @@ size limit are re-encoded (two-pass x264, audio copied) to
 `edit/<name>.instagram.mp4` instead of being refused.
 
 Also built: `--dry-run` (all checks and the summary, posts nothing).
+
+Also (Ali, 2026-10-29): Instagram Stories, `--to story` (alias `ig-story`), not part
+of `all`. Parts of at most 60 s, as even as possible, cut midway in a gap between
+caption cues (`edit/captions/final.en.srt`, else `final.srt`), sentence ends
+preferred; without captions, cut at the limit. Re-encoded (CRF 20, max 10 Mbps)
+to `edit/story/`, posted one at a time in order, no caption, no drafts.

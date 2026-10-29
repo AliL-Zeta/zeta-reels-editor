@@ -49,7 +49,9 @@ def test_privacy_has_no_default():
 def test_to_is_required_and_understands_aliases():
     assert publish.parse_to("fb,tiktok") == ["tiktok", "facebook"]
     assert publish.parse_to("IG") == ["instagram"]
-    assert publish.parse_to("all") == list(publish.PLATFORMS)
+    assert publish.parse_to("all") == ["tiktok", "instagram", "facebook"]
+    assert publish.parse_to("story,tt") == ["tiktok", "story"]
+    assert publish.parse_to("all,ig-story") == list(publish.PLATFORMS)
     for bad in (None, "", "youtube"):
         with pytest.raises(publish.PublishError):
             publish.parse_to(bad)
@@ -187,3 +189,38 @@ def test_fit_kbps_leaves_headroom():
     kbps = publish.fit_kbps(300 * MB, 172.0)
     assert (kbps + 192) * 1000 / 8 * 172.0 < 300 * MB
     assert kbps > 10_000          # a 3 min reel keeps a generous bitrate
+
+
+SRT = """1
+00:00:00,100 --> 00:00:20,000
+First thought, still going
+
+2
+00:00:20,400 --> 00:00:50,000
+and it ends here.
+
+3
+00:00:50,400 --> 00:01:10,000
+Next sentence, no stop
+
+4
+00:01:10,400 --> 00:01:40,000
+done now.
+
+5
+00:01:40,400 --> 00:02:10,000
+Last one.
+"""
+
+
+def test_story_cuts_fall_between_cues_at_sentence_ends_and_fit_60s():
+    breaks = publish.story_breaks(publish.srt_cues(SRT))
+    assert breaks[0] == (20.2, False) and breaks[1] == (50.2, True)
+    cuts = publish.story_cuts(130, breaks)
+    assert cuts == [50.2, 100.2]                    # sentence ends, not the even 43/87
+    edges = [0, *cuts, 130]
+    assert all(b - a <= 60 for a, b in zip(edges, edges[1:]))
+    assert publish.story_cuts(59, breaks) == []     # short enough: one Story
+    assert publish.story_cuts(130, []) == [60, 120]  # no captions: cut at the limit
+    # An early sentence end that would leave 3 parts' worth for 2 is not taken.
+    assert publish.story_cuts(170, [(50, True), (55, True), (110, True)]) == [55, 110]
