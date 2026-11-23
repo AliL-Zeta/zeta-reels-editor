@@ -732,3 +732,74 @@ def test_speech_in_a_word_gap_is_transcribed_and_spliced_in(tmp_path):
                                              Word(word="b", start=4.0, end=4.4)],
                                       meta={"silences": [[1.4, 4.0]]}),
                              wav, LLM(model="test"), work_dir=tmp_path / "g") == []
+
+
+def test_plan_chunks_ends_each_chunk_in_the_longest_nearby_pause():
+    pauses = [[40.0, 40.3], [52.0, 53.0], [58.0, 58.4], [100.0, 101.0]]
+    assert tg.plan_chunks(130.0, 60.0, 2.0, pauses=pauses) == [
+        (0.0, 52.5), (52.5, 100.5), (100.5, 130.0)]
+
+
+def test_plan_chunks_overlaps_only_where_there_is_no_pause():
+    # no pause in the 15 s before 60 s: fall back to the overlap there
+    assert tg.plan_chunks(100.0, 60.0, 2.0, pauses=[[20.0, 21.0]]) == [(0.0, 60.0), (58.0, 100.0)]
+
+
+def test_stitch_keeps_a_repeat_across_a_join_that_falls_in_a_pause():
+    chunks = [(0.0, [{"start": 0.0, "end": 5.0, "text": "I think about this recently"}]),
+              (5.0, [{"start": 0.0, "end": 2.0, "text": "recently I did"}])]
+    said = " ".join(s["text"] for s in tg.stitch_chunks(chunks, 2.0, [False, False]))
+    assert said == "I think about this recently recently I did"
+
+
+def test_doc_from_segments_records_each_chunk_window_and_its_words():
+    segs = [{"start": 1.0, "end": 3.0, "text": "واحد جوج", "window": [0.0, 50.0]},
+            {"start": 40.0, "end": 49.0, "text": "تلاتة", "window": [0.0, 50.0]},
+            {"start": 51.0, "end": 55.0, "text": "ربعة خمسة", "window": [50.0, 98.0]}]
+    doc = tg.doc_from_segments(segs, src="gemini")
+    assert doc.meta["chunks"] == [[0.0, 50.0, 0, 3], [50.0, 98.0, 3, 5]]
+
+
+def test_chunk_pass_beats_segment_hints_that_drifted(tmp_path, fake_whisperx):
+    # IMG_7718: from 4:40 Gemini's segment times ran 2-14 s late inside exact
+    # chunks; per-segment windows missed the speech and 59% of words went
+    # untimed. The chunk window is exact (we cut it), so its timings win.
+    from helpers import align_whisperx
+
+    doc = tg.doc_from_segments(
+        [{"start": 8.0, "end": 9.0, "text": "واحد جوج تلاتة ربعة", "window": [0.0, 8.0]},
+         {"start": 9.0, "end": 10.0, "text": "خمسة ستة", "window": [8.0, 10.0]}],
+        src="gemini")
+    cfg = cfgmod.load("transcribe")
+    cfg["alignment"]["align_latin_spans"] = False
+    align_whisperx.align(doc, tmp_path / "raw01.wav", cfg, device="cpu")
+    first = doc.words[0]
+    assert first.start < 1.0, first          # the segment hint put it at 8 s
+    assert [c["audio_len"] for c in fake_whisperx.calls[1:]] == [16000 * 8, 16000 * 2]
+    starts = [w.start for w in doc.words]
+    assert starts == sorted(starts) and all(w.timed for w in doc.words)
+
+
+def test_merge_keeps_a_segment_time_only_where_it_still_fits():
+    from helpers import align_whisperx
+
+    seg = [Word(word="a", start=0.0, end=0.5), Word(word="b", start=9.0, end=9.5),
+           Word(word="c", start=1.0, end=1.5)]
+    chunk = [Word(word="a", start=0.1, end=0.4), Word(word="b"),
+             Word(word="c", start=2.0, end=2.4)]
+    align_whisperx.merge_chunk_timings(seg, chunk)
+    assert (seg[0].start, seg[2].start) == (0.1, 2.0)
+    assert not seg[1].timed                  # 9.0 s cannot sit between 0.4 and 2.0
+
+
+def test_a_window_with_no_timed_neighbours_is_skipped_not_the_whole_file(tmp_path, fake_whisperx):
+    # newyt: a Latin run with no timed neighbour was bounded by 0 s .. end of file, so one English pass
+    # aligned 28 min of audio on CPU and swapped the Mac to 22 GB. Neither window path may do that.
+    from helpers import align_whisperx
+
+    doc = WordsDoc(words=[Word(word="واحد"), Word(word="Nvidia"), Word(word="جوج")])
+    audio = [0.0] * (16000 * 600)
+    assert align_whisperx.align_latin_spans(doc, audio, cfgmod.load("transcribe"), device="cpu") == 0
+    assert align_whisperx.realign_window(doc, None, 0, 3, cfgmod.load("transcribe"),
+                                         device="cpu", audio=audio) == 0
+    assert fake_whisperx.calls == []

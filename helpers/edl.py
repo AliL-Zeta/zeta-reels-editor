@@ -16,6 +16,7 @@ Everything downstream of the cut (captions, overlays, self-eval) uses
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -212,6 +213,26 @@ class EDL:
         return self
 
 
+def snap_to_frames(ranges: Iterable[Range], fps: float) -> list[Range]:
+    """Make every range render to exactly the length the plan says.
+
+    render.py cuts each range with `-t f"{end - start:.3f}"` and keeps every
+    frame whose time is below that, so a range of 9.55 s at 30 fps comes out as
+    287 frames = 9.567 s. Over 24 ranges that added 0.43 s the plan did not
+    know about, and captions and cards (timed from the plan) ran ahead of the
+    voice by the end of IMG_7560. Here each range is extended to a whole number
+    of frames (never shortened past a frame, so no word is cut) and its length
+    written as milliseconds rounded DOWN, which renders to exactly n frames.
+    """
+    out = []
+    for r in ranges:
+        start = round(r.start, 3)
+        frames = math.ceil((r.end - start) * fps - 1e-6)
+        end = start + math.floor(frames / fps * 1000 + 1e-6) / 1000
+        out.append(Range(**{**r.__dict__, "start": start, "end": round(end, 3)}))
+    return out
+
+
 def build(
     sources: dict[str, str],
     ranges: Iterable[Range],
@@ -221,7 +242,11 @@ def build(
     style_profile: str | None = None,
     aspect: str | None = None,
     meta: dict | None = None,
+    fps: float | None = None,
 ) -> EDL:
-    return EDL(sources=dict(sources), ranges=list(ranges), overlays=list(overlays),
-               subtitles=subtitles, style_profile=style_profile, aspect=aspect,
-               meta=meta or {})
+    if fps is None:   # the render's rate: the aspect's fps in configs/layout.yaml
+        from helpers import config as configs
+        fps = float(configs.get(configs.aspect_config(aspect)[1], "fps", 30))
+    return EDL(sources=dict(sources), ranges=snap_to_frames(ranges, fps),
+               overlays=list(overlays), subtitles=subtitles, style_profile=style_profile,
+               aspect=aspect, meta=meta or {})

@@ -182,8 +182,9 @@ Checked before anything uploads:
 - **Q5.** Same file on every platform.
 
 Also (Ali, same day): Facebook videos over 90 s go through the regular Page
-video API (`/{page}/videos`, Resumable Upload API), which Facebook shows as a
-Reel; needs the Meta login to be under ~60 days old. Instagram files over the
+video API (`/{page}/videos`, the Page's chunked upload start/transfer/finish,
+Page token only; the Resumable Upload API handle was refused on publish and a
+single POST hits HTTP 413, both tested 2026-10-29), which Facebook shows as a Reel. Instagram files over the
 size limit are re-encoded (two-pass x264, audio copied) to
 `edit/<name>.instagram.mp4` instead of being refused.
 

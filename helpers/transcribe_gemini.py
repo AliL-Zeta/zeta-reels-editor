@@ -193,30 +193,40 @@ def slice_wav(src: str | Path, start: float, end: float, out: str | Path) -> Pat
     return out
 
 
-def plan_chunks(duration_s: float, chunk_s: float, overlap_s: float = 0.0
+def plan_chunks(duration_s: float, chunk_s: float, overlap_s: float = 0.0,
+                pauses: Sequence[Sequence[float]] = (), search_s: float = 15.0
                 ) -> list[tuple[float, float]]:
-    """Chunk windows `[start, end)` that advance by `chunk_s - overlap_s`.
+    """Chunk windows `[start, end)` of at most `chunk_s`.
 
-    Overlap exists so no word falls on a chunk boundary: a model handed audio
-    that starts mid-word transcribes the fragment or drops it. The duplicated
-    speech is removed again in `stitch_chunks`.
+    A chunk ends in the longest pause of the last `search_s` before its limit,
+    and the next one starts there: no word is cut in half and no speech is
+    transcribed twice. Only where there is no pause do two chunks overlap by
+    `overlap_s`, and `stitch_chunks` removes the speech heard twice. That text
+    dedupe misses duplicates the model heard differently (IMG_7612: a garbled
+    second copy at 3:48, "recently" twice at 5:48), and the stray copies broke
+    the alignment of the minute around each join.
     """
     if duration_s <= 0:
         return []
     if chunk_s <= 0 or duration_s <= chunk_s:
         return [(0.0, duration_s)]
-    step = chunk_s - max(0.0, overlap_s)
-    if step <= 0:
+    if chunk_s - max(0.0, overlap_s) <= 0:
         raise TranscribeError(f"chunk_overlap_s ({overlap_s}) must be smaller "
                               f"than chunk_s ({chunk_s})")
     out: list[tuple[float, float]] = []
     start = 0.0
-    while start < duration_s:
-        end = min(start + chunk_s, duration_s)
-        out.append((start, end))
-        if end >= duration_s:
-            break
-        start += step
+    while duration_s - start > chunk_s:
+        limit = start + chunk_s
+        near = [p for p in pauses if limit - search_s <= (p[0] + p[1]) / 2 <= limit]
+        if near:
+            a, b = max(near, key=lambda p: p[1] - p[0])
+            cut = round((a + b) / 2, 3)
+            out.append((start, cut))
+            start = cut
+        else:
+            out.append((start, limit))
+            start = limit - max(0.0, overlap_s)
+    out.append((start, duration_s))
     return out
 
 
@@ -287,13 +297,16 @@ def overlap_token_count(tail: Sequence[str], head: Sequence[str]) -> int:
 
 
 def stitch_chunks(chunks: Sequence[tuple[float, Sequence[dict]]],
-                  overlap_s: float) -> list[dict]:
-    """Concatenate per-chunk segments, removing the re-transcribed overlap."""
+                  overlap_s: float, overlapped: Sequence[bool] | None = None) -> list[dict]:
+    """Concatenate per-chunk segments, removing the re-transcribed overlap.
+
+    `overlapped[k]` says whether chunk k re-hears the end of chunk k-1; a chunk
+    that starts in a pause does not, and a repeat there is real speech."""
     out: list[dict] = []
     window = max(8, int(math.ceil(max(0.0, overlap_s) * TOKENS_PER_SECOND)))
-    for offset, segments in chunks:
+    for k, (offset, segments) in enumerate(chunks):
         segs = _shift(segments, offset)
-        if not out:
+        if not out or (overlapped is not None and not overlapped[k]):
             out.extend(segs)
             continue
         tail = _segment_tokens(out)[-window:]
@@ -319,6 +332,18 @@ def doc_from_segments(segments: Sequence[dict], *, src: str, **kw: Any) -> Words
         spans.append([i, i + n])
         i += n
     doc.meta["segment_word_spans"] = spans
+    # [t0, t1, first_word, end_word] per transcription chunk, for align_chunks.
+    chunks: list[list] = []
+    for s, (a, b) in zip(segments, spans):
+        win = s.get("window")
+        if not win:
+            continue
+        if chunks and chunks[-1][:2] == [float(win[0]), float(win[1])]:
+            chunks[-1][3] = b
+        else:
+            chunks.append([float(win[0]), float(win[1]), a, b])
+    if chunks:
+        doc.meta["chunks"] = chunks
     return doc
 
 
@@ -369,6 +394,16 @@ def _parse_segments(payload: Any) -> list[dict]:
     return segs
 
 
+def _pauses(wav: Path) -> list[list[float]]:
+    """Silences of at least 0.4 s in a 16-bit PCM WAV, for chunk boundaries."""
+    import numpy as np  # lazy: stdlib-only import rule
+    from helpers.align_whisperx import measure_silences
+    with _open_wav(wav) as w:
+        rate = w.getframerate()
+        x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    return measure_silences(x.astype(np.float32) / 32768.0, sr=rate, min_s=0.4)
+
+
 def _gemini_chunked(
     wav: Path,
     cfg: dict,
@@ -388,7 +423,8 @@ def _gemini_chunked(
     work_dir = Path(work_dir or wav.parent / "chunks")
 
     results: list[tuple[float, list[dict]]] = []
-    windows = plan_chunks(duration, chunk_s, overlap_s)
+    windows = plan_chunks(duration, chunk_s, overlap_s, pauses=_pauses(wav) if
+                          chunk_s and duration > chunk_s else ())
     for start, end in windows:
         if len(windows) == 1 and start == 0.0:
             part = wav
@@ -406,9 +442,13 @@ def _gemini_chunked(
             files=[part],
             temperature=float(bcfg.get("temperature") or 0.0),
         )
-        results.append((start, _parse_segments(payload)))
+        # The chunk window is exact audio we cut; the model's times inside it are
+        # not. The aligner uses the window when the times drift (IMG_7718).
+        results.append((start, [{**s, "window": [start, end]}
+                                for s in _parse_segments(payload)]))
 
-    return stitch_chunks(results, overlap_s)
+    overlapped = [k > 0 and windows[k][0] < windows[k - 1][1] for k in range(len(windows))]
+    return stitch_chunks(results, overlap_s, overlapped)
 
 
 def gemini_flash_lite(wav: Path, cfg: dict, llm: LLM, **kw: Any) -> WordsDoc:

@@ -185,7 +185,10 @@ def repair_windows(doc: WordsDoc, indices: Sequence[int],
             windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
         else:
             windows.append((lo, hi))
-    return windows
+    # Merging is unbounded, so cut each merged run back to the per-window cap:
+    # IMG_7718 merged 1072 words / 403 s into one CPU re-align and hit 17 GB.
+    return [(a, min(a + MAX_WINDOW_WORDS, hi)) for lo, hi in windows
+            for a in range(lo, hi, MAX_WINDOW_WORDS)]
 
 
 RealignFn = Callable[..., int]

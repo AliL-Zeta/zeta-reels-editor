@@ -525,8 +525,93 @@ def _dangles(text: str) -> bool:
     return t.endswith("-") or (last in _DANGLING and not re.search(r"[.,;:!?]$", t))
 
 
+def voiced_mask(samples, *, sr: int = 16000, frame_s: float = 0.01,
+                above_floor_db: float = 10.0) -> list[bool]:
+    """Per-frame "his voice is on": 10 dB over the take's noise floor (p10).
+
+    A floor-relative threshold marks where a word really begins; a speech-relative
+    one (the loud middle of syllables) put onsets 0.1-0.3 s late and once made a
+    wrong fix look right."""
+    import numpy as np  # lazy: stdlib-only import rule
+
+    x = np.asarray(samples, dtype=np.float32)
+    hop = max(1, int(frame_s * sr)); n = len(x) // hop
+    if n == 0:
+        return []
+    db = 20 * np.log10(np.sqrt((x[:n * hop].reshape(n, hop) ** 2).mean(axis=1)) + 1e-9)
+    return list(db > np.percentile(db, 10) + above_floor_db)
+
+
+def voiced_output_mask(wav: str | Path, edl: EDL, source: str | None = None,
+                       frame_s: float = 0.01) -> list[bool]:
+    """`voiced_mask` of the edited audio (the EDL's kept ranges, in order).
+
+    The noise floor is measured on what is kept: the raw take's long cut pauses
+    pull the floor down and mark too much as voice (32 off-sync cues vs 18)."""
+    import wave
+    import numpy as np  # lazy
+
+    with wave.open(str(wav)) as f:
+        sr = f.getframerate()
+        x = np.frombuffer(f.readframes(f.getnframes()), np.int16).astype(np.float32) / 32768
+    parts = [x[int(round(r.start * sr)):int(round(r.end * sr))] for r in edl.ranges
+             if not source or r.source == source]
+    return voiced_mask(np.concatenate(parts) if parts else x[:0], sr=sr, frame_s=frame_s)
+
+
+def sync_starts(starts: Sequence[float], word_starts: Sequence[tuple[float, float]],
+                voiced: Sequence[bool] | None, *, search_s: float = 0.8,
+                pause_s: float = 0.25, lead_s: float = 0.03,
+                frame_s: float = 0.01) -> list[float]:
+    """Put each cue start where his voice starts (Ali, 2026-11-01: "décalé").
+
+    English cue starts are interpolated inside the Darija fragment they translate,
+    so 14% landed in a pause (caption before the voice) or after the first word
+    (caption late). Each start goes to the nearest real word start, preferring one
+    that follows a pause; then the audio decides: if the voice resumed after a
+    >= `pause_s` silence shortly before, with no other pause since, the cue starts
+    there; if the cue sits in silence, it starts with the next voice. Order is kept.
+    `word_starts` are (start, end) of the spoken words on the same timeline.
+    """
+    pause_n = int(round(pause_s / frame_s)); look = int(round(search_s / frame_s))
+    n = len(voiced) if voiced is not None else 0
+
+    def quiet_run(a: int, b: int) -> bool:
+        q = 0
+        for v in voiced[a:b + 1]:
+            q = 0 if v else q + 1
+            if q >= pause_n:
+                return True
+        return False
+
+    out: list[float] = []
+    prev = float("-inf")
+    for s in starts:
+        cands = [(k, ws) for k, (ws, _we) in enumerate(word_starts)
+                 if abs(ws - s) <= search_s and ws > prev + 0.3]
+        if cands:
+            paused = [c for c in cands
+                      if c[0] == 0 or c[1] - word_starts[c[0] - 1][1] >= pause_s]
+            near = [c for c in cands if abs(c[1] - s) <= search_s / 2]
+            s = min(paused or near or cands, key=lambda c: abs(c[1] - s))[1]
+        i = int(s / frame_s)
+        if 0 <= i < n and voiced[i]:
+            on = next((j for j in range(i, max(i - look, pause_n), -1)
+                       if voiced[j] and not any(voiced[j - pause_n:j])), None)
+            if on is not None and on * frame_s > prev + 0.3 and not quiet_run(on, i):
+                s = on * frame_s - lead_s
+        elif 0 <= i < n:
+            nxt = next((j for j in range(i, min(i + look, n)) if voiced[j]), None)
+            if nxt is not None:
+                s = nxt * frame_s - lead_s
+        s = max(s, prev + 0.3) if out else s
+        out.append(round(s, 3)); prev = s
+    return out
+
+
 def readable_english(cues: Sequence[Cue], english: Sequence[str],
-                     rules: Mapping | None = None) -> list[tuple[float, float, str]]:
+                     rules: Mapping | None = None,
+                     voiced: Sequence[bool] | None = None) -> list[tuple[float, float, str]]:
     """Regroup per-fragment English into cues a viewer can actually read.
 
     Fragments follow the Darija chunking (2-4 words), so their English came out
@@ -601,12 +686,18 @@ def readable_english(cues: Sequence[Cue], english: Sequence[str],
                 i = max(a - 1, 0)
                 continue
         i += 1
+    if voiced is not None:
+        spans = [(w.start, w.end) for c in cues for w in c.words
+                 if w.start is not None and w.end is not None]
+        for cue, s in zip(out, sync_starts([c[0] for c in out], spans, voiced)):
+            cue[0] = s
     for i, cue in enumerate(out):
         nxt = out[i + 1][0] - r["gap_s"] if i + 1 < len(out) else cue[1] + r["max_duration_s"]
         want = cue[0] + max(r["min_duration_s"], len(cue[2]) / r["max_cps"])
         cue[1] = max(cue[1], min(want, nxt, cue[0] + r["max_duration_s"]))
         if 0 < nxt - cue[1] < 0.3:      # a sub-0.3 s blank between two cues reads as flicker
             cue[1] = nxt
+        cue[1] = min(cue[1], nxt)       # a start synced earlier must not overlap this one
     return [tuple(c) for c in out]
 
 
@@ -640,7 +731,8 @@ def break_line(text: str, cap: int) -> str:
 
 
 def render_ass(cues: Sequence[Cue], style: CaptionStyle,
-               english: Sequence[str] | None = None) -> str:
+               english: Sequence[str] | None = None,
+               voiced: Sequence[bool] | None = None) -> str:
     karaoke_on = bool(style.style.get("highlight_active_word"))
     lines = [ass_header(style)]
     ecfg = _english_cfg()
@@ -666,7 +758,7 @@ def render_ass(cues: Sequence[Cue], style: CaptionStyle,
         # English alone owns the screen, so it gets its own readable timing
         # instead of inheriting the Darija fragments'.
         lines += [en_line(s, e, t) for s, e, t in
-                  readable_english(cues, english, ecfg.get("readability"))]
+                  readable_english(cues, english, ecfg.get("readability"), voiced)]
         return "\n".join(lines) + "\n"
     for n, cue in enumerate(cues):
         if english and english[n].strip():
@@ -904,12 +996,18 @@ def write_captions(words: WordsDoc | Mapping[str, WordsDoc], edl: EDL,
         except Exception as exc:   # Darija still ships; the caller flags the miss
             english_error = str(exc)
     ass_path = edit_paths.captions / "final.ass"
-    ass_path.write_text(render_ass(cues, st, english), encoding="utf-8")
+    # English cue starts are interpolated; sync them to his voice when the take's audio is here.
+    voiced = None
+    name = source or next(iter(edl.sources), None)
+    wav = edit_paths.audio / f"{name}.16k.wav" if name else None
+    if english and wav is not None and wav.exists():
+        voiced = voiced_output_mask(wav, edl, name)
+    ass_path.write_text(render_ass(cues, st, english, voiced), encoding="utf-8")
     if english:
         (edit_paths.captions / "final.en.srt").write_text("\n".join(
             f"{i}\n{_srt_time(s)} --> {_srt_time(e)}\n{t}\n"
             for i, (s, e, t) in enumerate(readable_english(
-                cues, english, _english_cfg().get("readability")), start=1)),
+                cues, english, _english_cfg().get("readability"), voiced), start=1)),
             encoding="utf-8")
 
     caps = configs.load("captions") if srt is None else {}

@@ -80,3 +80,26 @@ def test_round_trip_keeps_the_v1_subset_render_py_reads(simple_edl, tmp_path):
 def test_empty_edl_is_refused():
     with pytest.raises(EDLError, match="no ranges"):
         EDL(sources={"a": "/a.mp4"}).validate()
+
+
+@pytest.mark.parametrize("fps", [30, 25, 24, 30000 / 1001, 60])
+def test_ranges_render_to_exactly_the_planned_length(fps):
+    """render.py cuts with `-t f"{end - start:.3f}"` (from the saved, rounded
+    values) and keeps every frame before that time. Unsnapped, IMG_7560 came out
+    0.43 s longer than its plan and the captions ran ahead of the voice."""
+    import random
+
+    from helpers.edl import snap_to_frames
+    rng = random.Random(7)
+    raw = [Range("a", s, s + rng.uniform(0.2, 20)) for s in (rng.uniform(0, 600) for _ in range(2000))]
+    drift = 0.0
+    for before, r in zip(raw, snap_to_frames(raw, fps)):
+        d = Range.from_dict(r.to_dict()).duration          # what render.py reads back
+        frames = 0
+        while frames / fps < float(f"{d:.3f}") - 1e-9:        # what render.py keeps
+            frames += 1
+        assert -1e-9 <= frames / fps - d < 0.001               # rendered == planned, < 1 ms
+        assert r.end >= before.end - 0.001                     # only ever extended: no word cut
+        assert r.end - before.end < 1 / fps + 0.001
+        drift += frames / fps - d
+    assert drift / len(raw) < 0.001

@@ -31,6 +31,7 @@ import argparse
 import functools
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -463,6 +464,12 @@ class _ModelCache:
 _MODELS = _ModelCache()
 
 
+# A one-window re-align (Latin run, QA repair) never gets more audio than a transcription chunk. With no
+# timed neighbour, bound_run falls back to the whole file: 403 s hit 17 GB (IMG_7718), 28 min swapped 22 GB
+# (newyt). Such a window is left to QA instead.
+MAX_WINDOW_S = 60.0
+
+
 def _window_device(device: str) -> str:
     """Device for the one-window re-aligns (QA repairs, Latin runs).
 
@@ -478,9 +485,17 @@ def _run_align(segments: list[dict], audio, *, language: str, device: str,
                model_name: str | None, interpolate: str) -> list[dict]:
     wx = _whisperx()
     model, metadata = _MODELS.get(language, device, model_name)
-    result = wx.align(segments, model, metadata, audio, device,
-                      return_char_alignments=False,
-                      interpolate_method=interpolate)
+    try:
+        result = wx.align(segments, model, metadata, audio, device,
+                          return_char_alignments=False,
+                          interpolate_method=interpolate)
+    except NotImplementedError:
+        # MPS caps a conv at 65536 output channels: a long segment (an 8:42
+        # chat, IMG_7612) crashes the GPU pass. Same model, same times on CPU.
+        if device != "mps":
+            raise
+        return _run_align(segments, audio, language=language, device="cpu",
+                          model_name=model_name, interpolate=interpolate)
     return result.get("segments") or []
 
 
@@ -522,6 +537,8 @@ def align(
         apply_aligned(doc.words[a:b], spans,
                       map_returned(alias_tokens, _returned_tokens(seg)))
 
+    align_chunks(doc, audio, cfg, device=device)
+
     if acfg.get("align_latin_spans", True):
         align_latin_spans(doc, audio, cfg, device=device, duration=duration)
 
@@ -535,6 +552,59 @@ def align(
         "coverage": round(doc.coverage(), 4),
     }
     return doc
+
+
+def align_chunks(doc: WordsDoc, audio: Any, cfg: dict | None = None, *,
+                 device: str | None = None) -> int:
+    """Re-align every transcription chunk against its exact window; returns words timed.
+
+    The segment pass trusts the transcriber's times, and inside a chunk they
+    drift: on IMG_7718 they ran 2-14 s late from 4:40 on and 59% of words came
+    back untimed. Where both passes timed a word and disagreed, the chunk pass
+    scored 0.65-0.71 against 0.32-0.40, so it wins. A chunk is at most a
+    minute: CPU, like every other variable-length window (_window_device).
+    """
+    chunks = doc.meta.get("chunks") or []
+    if not chunks:
+        return 0
+    acfg = cfgmod.get(cfg or {}, "alignment") or {}
+    device = _window_device(device or resolve_device(cfg))
+    timed = 0
+    for t0, t1, a, b in chunks:
+        fresh = [replace(w, start=None, end=None, score=None) for w in doc.words[a:b]]
+        text, spans = build_align_text(fresh)
+        clip = audio[int(t0 * SAMPLE_RATE):int(t1 * SAMPLE_RATE)]
+        segments = _run_align([{"start": 0.0, "end": t1 - t0, "text": text}], clip,
+                              language=doc.language or "ar", device=device,
+                              model_name=acfg.get("model"),
+                              interpolate=acfg.get("interpolate_method", "ignore"))
+        if not segments:
+            continue
+        alias_tokens = [t for w in fresh for t in align_token(w).split()]
+        apply_aligned(fresh, spans, map_returned(alias_tokens, _returned_tokens(segments[0])),
+                      offset=t0)
+        timed += merge_chunk_timings(doc.words[a:b], fresh)
+    return timed
+
+
+def merge_chunk_timings(words: Sequence[Word], chunk: Sequence[Word]) -> int:
+    """Chunk-pass times win; a segment-pass time stays only where it still fits.
+
+    whisperx can return part of a long window (IMG_7718: 42 of 119 words), so the
+    segment pass fills the rest, but only between its chunk-timed neighbours: a
+    time that breaks the order is a drifted window and is cleared for QA to repair.
+    """
+    for w, c in zip(words, chunk):
+        if c.timed:
+            w.start, w.end, w.score = c.start, c.end, c.score
+    for k, (w, c) in enumerate(zip(words, chunk)):
+        if c.timed or not w.timed:
+            continue
+        prev = next((x for x in reversed(chunk[:k]) if x.timed), None)
+        nxt = next((x for x in chunk[k + 1:] if x.timed), None)
+        if (prev and w.start < prev.end - 1e-6) or (nxt and w.end > nxt.start + 1e-6):
+            w.start = w.end = w.score = None
+    return sum(1 for w in words if w.timed)
 
 
 def align_latin_spans(doc: WordsDoc, audio: Any, cfg: dict | None = None, *,
@@ -551,7 +621,7 @@ def align_latin_spans(doc: WordsDoc, audio: Any, cfg: dict | None = None, *,
     fixed = 0
     for i, j in latin_runs(doc.words):
         lo, hi = bound_run(doc.words, i, j, lo=0.0, hi=duration)
-        if hi - lo < 0.05:
+        if not 0.05 <= hi - lo <= MAX_WINDOW_S:
             continue
         clip = audio[int(lo * SAMPLE_RATE):int(hi * SAMPLE_RATE)]
         text = " ".join(w.word for w in doc.words[i:j])
@@ -592,7 +662,7 @@ def realign_window(doc: WordsDoc, wav: str | Path, i: int, j: int,
     # model speech that is not in its text, and on a real take it put the
     # window's first word 2.0 s back, on top of its neighbour. `pad_s` is unused.
     lo, hi = bound_run(doc.words, i, j, lo=0.0, hi=duration)
-    if hi - lo < 0.05:
+    if not 0.05 <= hi - lo <= MAX_WINDOW_S:
         return 0
 
     clip = audio[int(lo * SAMPLE_RATE):int(hi * SAMPLE_RATE)]

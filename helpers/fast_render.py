@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 from helpers import render as vendored
@@ -32,6 +34,28 @@ def base_key(edl: dict, fps: str | None, preview: bool, draft: bool) -> str:
         "fps": str(fps), "preview": preview, "draft": draft,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def check_segment_lengths(edl: dict, segments: list[Path]) -> None:
+    """Captions, cards and notes are timed from the plan's range lengths; if a
+    cut segment comes out longer (render.py rounds to whole frames), everything
+    after it runs ahead of the voice. Stop instead of shipping that."""
+    drift = 0.0
+    for r, seg in zip(edl.get("ranges") or [], segments):
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=duration,avg_frame_rate", "-of", "json", str(seg)],
+                             capture_output=True, text=True, check=True)
+        st = json.loads(out.stdout)["streams"][0]
+        frame = 1 / float(Fraction(st["avg_frame_rate"]))
+        err = float(st["duration"]) - (float(r["end"]) - float(r["start"]))
+        drift += err
+        # One frame too many in one segment is the bug; the plan's millisecond
+        # rounding leaves < 1 ms per segment, so the total gets two frames.
+        if abs(err) >= frame / 2 or abs(drift) >= 2 * frame:
+            raise RuntimeError(
+                f"{seg.name}: the render is {drift * 1000:+.0f} ms off the plan, captions and "
+                "cards would drift from the voice. Rebuild the EDL with edl.build (it snaps "
+                "ranges to whole frames) and render again.")
 
 
 def render(edl_path: str | Path, out_path: str | Path, *, fps: str | None = None,
@@ -51,6 +75,7 @@ def render(edl_path: str | Path, out_path: str | Path, *, fps: str | None = None
     else:
         segments = vendored.extract_all_segments(edl, edit_dir, preview=preview,
                                                  draft=draft, fps=fps)
+        check_segment_lengths(edl, segments)
         vendored.concat_segments(segments, base_path, edit_dir)
         stamp.write_text(key, encoding="utf-8")
 

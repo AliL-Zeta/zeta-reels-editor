@@ -84,6 +84,7 @@ PRIVACY_LEVELS = ("PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS",
                   "FOLLOWER_OF_CREATOR", "SELF_ONLY")
 VIDEO_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm"}
 MB = 1024 * 1024
+STORY_FONT = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
 
 
 class PublishError(RuntimeError):
@@ -242,7 +243,10 @@ def story_cuts(duration: float, breaks: list[tuple[float, bool]], max_s: float =
         # Not so early that the rest no longer fits in n - 1 parts.
         lo = max(start + min_s, duration - (n - 1) * max_s)
         ok = [(t, s) for t, s in breaks if lo <= t <= min(start + max_s, duration - min_s)]
-        pool = [t for t, s in ok if s] or [t for t, _ in ok] or [start + max_s]
+        # A sentence end only when it is close to even; otherwise the nearest
+        # gap between cues (IMG_7612: sentence ends alone gave 0:34, 0:42, then 0:58s).
+        pool = [t for t, s in ok if s and abs(t - target) <= 0.15 * max_s] \
+            or [t for t, _ in ok] or [start + max_s]
         start = min(pool, key=lambda t: abs(t - target))
         cuts.append(start)
     return cuts
@@ -532,10 +536,6 @@ def login_meta(page: str | None = None) -> None:
     ig = p.get("instagram_business_account") or {}
     _save_secret("meta", {"page_id": p["id"], "page_name": p["name"],
                           "page_token": p["access_token"],
-                          # Only long Facebook videos need it (upload sessions are
-                          # per user); it lasts ~60 days, the Page token does not expire.
-                          "user_token": long, "user_token_expires_at":
-                              time.time() + int(exchanged.get("expires_in", 60 * 86400)),
                           "ig_id": ig.get("id"), "ig_username": ig.get("username")})
     print(f"Facebook Page: {p['name']}\nInstagram: "
           + (f"@{ig['username']}" if ig else "none linked to this Page (link it in Page settings)"))
@@ -603,32 +603,47 @@ def preflight_facebook(job: dict, media: dict, limits: dict) -> dict:
     if media["duration"] < limits["min_duration_s"]:
         raise PublishError(f"Facebook needs at least {limits['min_duration_s']}s")
     long = media["duration"] > limits["facebook_max_s"]
-    if long and time.time() > meta.get("user_token_expires_at", 0) - 86400:
-        raise PublishError("long videos need a fresh Meta login: `zeta publish --login meta`")
     detail = "draft" if job.get("draft") else "published"
     return {"meta": meta, "long": long, "account": f"{meta['page_name']} (Page)",
             "detail": detail + (", as video" if long else "")}
 
 
 def _post_facebook_long(job: dict, meta: dict, video: Path, caption: str) -> str:
-    """Resumable Upload API: session and bytes with the user token, publish with
-    the Page token. Returns the video id."""
-    app_id, _ = _env("META_APP_ID", "META_APP_SECRET")
-    user, size = meta["user_token"], video.stat().st_size
-    session = _graph("POST", f"{app_id}/uploads", user, file_name=video.name,
-                     file_length=size, file_type="video/mp4")["id"]
+    """The Page's own chunked upload (upload_phase start/transfer/finish), Page
+    token only; Facebook picks each chunk's size. Returns the video id.
+
+    Tested 2026-10-29: the Resumable Upload API handle was refused on publish
+    (6000/1363048) for every file, and a single multipart POST gets HTTP 413
+    above some size between 32 and 164 MB. This route took 164 MB in 34 chunks."""
+    token, page, host = meta["page_token"], meta["page_id"], "graph-video.facebook.com"
+    size = video.stat().st_size
+    st = _graph("POST", f"{page}/videos", token, host=host, upload_phase="start", file_size=size)
+    session, start, end = st["upload_session_id"], int(st["start_offset"]), int(st["end_offset"])
+    url = f"https://{host}/{_cfg()['graph_version']}/{page}/videos"
     with video.open("rb") as fh:
-        status, body = _request(
-            f"https://graph.facebook.com/{_cfg()['graph_version']}/{session}", data=fh,
-            headers={"Authorization": f"OAuth {user}", "file_offset": "0",
-                     "Content-Length": str(size)})
-    if "h" not in body:
-        raise PublishError(f"upload failed: HTTP {status} {body.get('error')}")
-    params = {"fbuploader_video_file_chunk": body["h"], "description": caption}
+        while start < end:
+            fh.seek(start)
+            boundary = "zeta" + secrets.token_hex(8)
+            fields = {"access_token": token, "upload_phase": "transfer",
+                      "upload_session_id": session, "start_offset": start}
+            body = "".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+                           for k, v in fields.items())
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; name="video_file_chunk"; '
+                     'filename="chunk"\r\nContent-Type: application/octet-stream\r\n\r\n')
+            data = body.encode() + fh.read(end - start) + f"\r\n--{boundary}--\r\n".encode()
+            status, resp = _request(url, data=data, headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"})
+            if "start_offset" not in resp:
+                err = resp.get("error", {})
+                raise PublishError(f"Facebook upload failed at byte {start}: HTTP {status} "
+                                   f"{err.get('code')}/{err.get('error_subcode', '-')}: {err.get('message')}")
+            start, end = int(resp["start_offset"]), int(resp["end_offset"])
+            print(f"  facebook: uploaded {start / size:.0%}", end="\r")
+    params = {"upload_phase": "finish", "upload_session_id": session, "description": caption}
     if job.get("draft"):
         params["published"] = "false"
-    return _graph("POST", f"{meta['page_id']}/videos", meta["page_token"],
-                  host="graph-video.facebook.com", **params)["id"]
+    _graph("POST", f"{page}/videos", token, host=host, **params)
+    return st["video_id"]
 
 
 def post_facebook(job: dict, ctx: dict, caption: str) -> dict:
@@ -658,25 +673,39 @@ def post_facebook(job: dict, ctx: dict, caption: str) -> dict:
 
 def cut_story_parts(video: Path, cuts: list[float], duration: float) -> list[Path]:
     """Re-encoded, not stream-copied: a copy can only start on a keyframe, which
-    would shift the cut off the sentence end. Capped at 10 Mbps so a 60 s part
-    stays ~75 MB. Cached next to the video."""
+    would shift the cut off the sentence end. Cached next to the video.
+
+    720x1280, the size Instagram shows Stories at: at 1080x1920 every part over
+    ~30 s failed Meta's upload processing ("Request processing failed", tested
+    2026-10-30 on IMG_7612); the same 53 s and 58 s parts at 720p went through."""
     out_dir = _edit_dir(video) / "story"
     out_dir.mkdir(parents=True, exist_ok=True)
     edges = [0.0, *cuts, duration]
+    # Same names for a different split would reuse stale parts: remember the cut points.
+    stamp = out_dir / f".{video.stem}.cuts"
+    key = json.dumps({"edges": edges, "size": "720x1280"})
+    fresh = stamp.exists() and stamp.read_text() == key
     parts = []
     for i, (a, b) in enumerate(zip(edges, edges[1:]), 1):
         out = out_dir / f"{video.stem}.part{i}of{len(edges) - 1}.mp4"
-        if not (out.exists() and out.stat().st_mtime >= video.stat().st_mtime):
+        if not (fresh and out.exists() and out.stat().st_mtime >= video.stat().st_mtime):
             try:
+                # "2/9" at the top, so a viewer knows where they are in the series.
+                # Below Instagram's progress bar and account row (top ~10%).
+                label = (f"drawtext=fontfile='{STORY_FONT}':text='{i}/{len(edges) - 1}':"
+                         "fontsize=h*0.028:fontcolor=white:borderw=3:bordercolor=black@0.7:"
+                         "x=(w-text_w)/2:y=h*0.115")
                 subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{a:.3f}", "-to", f"{b:.3f}",
-                                "-i", str(video), "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-                                "-maxrate", "10M", "-bufsize", "20M", "-pix_fmt", "yuv420p",
+                                "-i", str(video), "-vf", f"scale=720:1280,{label}",
+                                "-c:v", "libx264", "-preset", "medium", "-crf", "21",
+                                "-maxrate", "4M", "-bufsize", "8M", "-pix_fmt", "yuv420p",
                                 "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)],
                                check=True)
             except subprocess.CalledProcessError as exc:
                 out.unlink(missing_ok=True)
                 raise PublishError(f"cutting Story part {i} failed: {exc}")
         parts.append(out)
+    stamp.write_text(key)
     for old in out_dir.glob(f"{video.stem}.part*.mp4"):   # from an earlier split
         if old not in parts:
             old.unlink()
@@ -704,7 +733,7 @@ def preflight_story(job: dict, media: dict, limits: dict) -> dict:
     if quota.get("quota_usage", 0) + len(parts) > quota.get("config", {}).get("quota_total", 1e9):
         raise PublishError(f"Instagram daily API post limit leaves no room for {len(parts)} Stories")
     edges = [0.0, *cuts, media["duration"]]
-    lengths = " ".join(f"{int(b - a) // 60}:{round(b - a) % 60:02d}" for a, b in zip(edges, edges[1:]))
+    lengths = " ".join(f"{round(b - a) // 60}:{round(b - a) % 60:02d}" for a, b in zip(edges, edges[1:]))
     return {"meta": meta, "parts": [str(p) for p in parts], "account": f"@{meta['ig_username']}",
             "detail": f"{len(parts)} Stories {lengths}"}
 

@@ -86,6 +86,18 @@ def test_repair_windows_merge_neighbouring_defects():
     assert lo < 10 and hi > 12
 
 
+def test_merged_repair_windows_never_exceed_the_window_cap():
+    # IMG_7718: 1300 untimed words merged into one 1072-word, 403 s window and
+    # the CPU re-align of it took the process to 17 GB on an 8 GB Mac.
+    doc = clean_doc(400)
+    for w in doc.words[50:350]:
+        w.start = w.end = None
+    windows = qa_words.repair_windows(doc, list(range(50, 350)), CFG)
+    assert max(hi - lo for lo, hi in windows) <= qa_words.MAX_WINDOW_WORDS
+    assert windows[0][0] <= 50 and windows[-1][1] >= 350
+    assert all(a[1] == b[0] for a, b in zip(windows, windows[1:]))
+
+
 # -- the repair pass ----------------------------------------------------------
 
 

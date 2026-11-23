@@ -34,7 +34,7 @@ def page(items: Sequence[dict]) -> str:
     <span class="src">{html.escape(urlparse(it.get('url') or '').netloc)}</span></div>
   <div class="said" dir="auto">&ldquo;{html.escape(it.get('said') or '')}&rdquo;</div>
   <div class="claim">{html.escape(it.get('claim') or '')}</div>
-  <img src="/img/{sid}" alt="">
+  {f'<video src="/img/{sid}" controls playsinline preload="metadata"></video>' if str(it.get('image','')).endswith('.mp4') else f'<img src="/img/{sid}" alt="">'}
   <div class="btns">
     <button class="keep on" onclick="pick('{sid}',true)">&#10003; Keep</button>
     <button class="drop" onclick="pick('{sid}',false)">&#10007; Drop</button>
@@ -52,7 +52,7 @@ h1{{font-size:20px;margin:0 0 4px}} p.hint{{color:#aaa;margin:0 0 16px}}
 .card.dropped{{border-color:#c62828;opacity:.55}}
 .meta{{color:#bbb;font-size:14px}} .said{{margin:6px 0;font-size:17px}}
 .claim{{color:#9ecbff;font-size:14px;margin-bottom:8px}}
-img{{width:100%;border-radius:6px;background:#fff}}
+img,video{{width:100%;border-radius:6px;background:#fff}}
 .btns{{display:flex;gap:8px;margin-top:8px}} button{{flex:1;padding:10px;border:0;border-radius:8px;
 font-size:16px;background:#333;color:#eee;cursor:pointer}}
 button.keep.on{{background:#2e7d32}} button.drop.on{{background:#c62828}}
@@ -113,7 +113,26 @@ def review(items: Sequence[dict], *, open_browser: bool = True, port: int = 0) -
             if self.path.startswith("/img/"):
                 img = images.get(self.path[5:])
                 if img and img.exists():
-                    return self._send(200, img.read_bytes(), "image/png")
+                    # Clips (VFX inserts) play inline; everything else is a PNG card.
+                    ctype = "video/mp4" if img.suffix == ".mp4" else "image/png"
+                    data = img.read_bytes()
+                    rng = self.headers.get("Range", "")
+                    if rng.startswith("bytes="):  # browsers seek in video with byte ranges
+                        a, _, b = rng[6:].partition("-")
+                        a = int(a or 0)
+                        b = min(int(b) if b else len(data) - 1, len(data) - 1)
+                        self.send_response(206)
+                        self.send_header("Content-Type", ctype)
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.send_header("Content-Range", f"bytes {a}-{b}/{len(data)}")
+                        self.send_header("Content-Length", str(b - a + 1))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(data[a:b + 1])
+                        except BrokenPipeError:  # the player cancelled this range to ask for another
+                            pass
+                        return
+                    return self._send(200, data, ctype)
                 return self._send(404, b"", "text/plain")
             self._send(200, body, "text/html; charset=utf-8")
 

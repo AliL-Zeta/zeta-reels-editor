@@ -229,7 +229,9 @@ def test_plan_ranges_build_a_valid_edl():
     plan = derive(doc, "one three five", {}, "raw01")
 
     built = edl.build({"raw01": "/tmp/raw01.mp4"}, plan.ranges).validate()
-    assert built.total_duration_s == pytest.approx(plan.kept_duration)
+    # build snaps each range out to whole frames (at most one 30 fps frame each)
+    slack = len(built.ranges) / 30 + 0.001
+    assert plan.kept_duration - 0.001 <= built.total_duration_s <= plan.kept_duration + slack
     assert plan.range_of_word(0) == 0 and plan.range_of_word(1) is None
 
 

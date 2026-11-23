@@ -224,3 +224,11 @@ def test_story_cuts_fall_between_cues_at_sentence_ends_and_fit_60s():
     assert publish.story_cuts(130, []) == [60, 120]  # no captions: cut at the limit
     # An early sentence end that would leave 3 parts' worth for 2 is not taken.
     assert publish.story_cuts(170, [(50, True), (55, True), (110, True)]) == [55, 110]
+
+
+def test_story_parts_stay_even_when_sentence_ends_are_far():
+    # sentence ends only at 34 s and 76 s; plenty of plain gaps between cues
+    breaks = [(t, t in (34.0, 76.0)) for t in [float(x) for x in range(5, 480, 3)]] + [(34.0, True), (76.0, True)]
+    edges = [0.0, *publish.story_cuts(483.0, sorted(breaks)), 483.0]
+    lengths = [b - a for a, b in zip(edges, edges[1:])]
+    assert len(lengths) == 9 and max(lengths) <= 60 and min(lengths) >= 48

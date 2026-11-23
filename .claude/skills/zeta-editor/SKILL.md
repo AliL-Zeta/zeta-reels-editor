@@ -100,7 +100,16 @@ decoration and not random headlines. Worked on the Hugging Face hack video
 6. **Density.** About 3 per minute across the whole video (his learned profile
    is `~/Movies/zeta/learn/style_profile.json`). 3 cards for 3 minutes is not
    enough.
-7. **Review before rendering.** Show every card on the review page
+7. **Pictures and tweets first, text only for facts (Ali, 2026-11-21).** "You
+   tend to find screenshots that are only text; I prefer pictures or tweets."
+   A person named -> their PHOTO (Perelman, Alpöge), optionally with the
+   statement card on top; an announcement -> the person's own TWEET, not a
+   blog paragraph; "a list of problems" -> a visual list/grid from the
+   official site; a paper or formula -> the paper's title page or the formula
+   itself. A highlighted text passage is for a precise fact (a number, a rule,
+   a quote) only. Before review, count the cards: if most are text blocks,
+   swap in visuals.
+8. **Review before rendering.** Show every card on the review page
    (`helpers/review_shots.py`, `zeta edit --review-shots`): time, what he says,
    the card, Keep/Drop, feedback, "use this link". Any feedback -> do not
    render; fix and show again. Render only after a clean approval.
@@ -193,6 +202,11 @@ english.readability`:
   a pause > 0.8 s, never inside a word.
 * **Where to break a line:** same priorities, bottom-heavy, a sentence end beats
   a balanced split.
+
+Sync (Ali, 2026-11-01, "décalé"): English cue starts are interpolated inside the Darija
+fragments; `captions.sync_starts` moves each to where his voice starts (applied automatically by
+`write_captions` when the take's 16k wav is in `edit/audio/`). Never anchor word timings to
+silences instead: measured worse and reverted.
 
 Check before rendering: read `captions/final.en.srt` top to bottom (it is the
 same cues as the burn). Hand fixes go into the .ass AFTER `stage_captions`;
